@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: sibaxcloud-api
+    runtime: python
+    repo: https://github.com/YOUR_USERNAME/YOUR_REPO_NAME  # Change this
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    healthCheckPath: /health
